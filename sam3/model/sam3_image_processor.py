@@ -220,3 +220,61 @@ class Sam3Processor:
         state["boxes"] = boxes
         state["scores"] = out_probs
         return state
+
+    @torch.inference_mode()
+    def set_text_prompts_batch(self, prompts: List[str], state: Dict):
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before set_text_prompts_batch")
+
+        num_prompts = len(prompts)
+
+        text_outputs = self.model.backbone.forward_text(prompts, device=self.device)
+        state["backbone_out"].update(text_outputs)
+
+        find_stage = FindStage(
+            img_ids=torch.zeros(num_prompts, device=self.device, dtype=torch.long),
+            text_ids=torch.arange(num_prompts, device=self.device, dtype=torch.long),
+            input_boxes=None,
+            input_boxes_mask=None,
+            input_boxes_label=None,
+            input_points=None,
+            input_points_mask=None,
+        )
+
+        geometric_prompt = self.model._get_dummy_prompt(num_prompts=num_prompts)
+
+        outputs = self.model.forward_grounding(
+            backbone_out=state["backbone_out"],
+            find_input=find_stage,
+            geometric_prompt=geometric_prompt,
+            find_target=None,
+        )
+
+        out_bbox = outputs["pred_boxes"]
+        out_logits = outputs["pred_logits"]
+        out_masks = outputs["pred_masks"]
+        out_probs = out_logits.sigmoid()
+        presence_score = outputs["presence_logit_dec"].sigmoid().unsqueeze(-1)
+        out_probs = (out_probs * presence_score).squeeze(-1)
+
+        img_h = state["original_height"]
+        img_w = state["original_width"]
+        scale_fct = torch.tensor([img_w, img_h, img_w, img_h], device=self.device)
+
+        results = []
+        for i in range(num_prompts):
+            keep = out_probs[i] > self.confidence_threshold
+            probs_i = out_probs[i][keep]
+            masks_i = out_masks[i][keep]
+            boxes_i = out_bbox[i][keep]
+            boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_i) * scale_fct[None, :]
+            masks_i = interpolate(masks_i.unsqueeze(1), (img_h, img_w), mode="bilinear", align_corners=False).sigmoid()
+            results.append({
+                "prompt": prompts[i],
+                "masks": masks_i > 0.5,
+                "masks_logits": masks_i,
+                "boxes": boxes_xyxy,
+                "scores": probs_i,
+            })
+
+        return results
